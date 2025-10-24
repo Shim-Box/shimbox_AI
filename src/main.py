@@ -27,7 +27,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 DERIVED_FORMULAS = [
     ("time_per_delivery", lambda df: df["work_hours"] / df["deliveries"].replace(0, np.nan)),
     ("deliveries_per_hour", lambda df: df["deliveries"] / df["work_hours"].replace(0, np.nan)),
-    ("steps_per_hour",  lambda df: df["steps"] / df["work_hours"].replace(0, np.nan)),
+    ("steps_per_hour", lambda df: df["steps"] / df["work_hours"].replace(0, np.nan)),
     ("steps_per_delivery", lambda df: df["steps"] / df["deliveries"].replace(0, np.nan)),
     ("hr_per_step", lambda df: df["avg_hr"] / df["steps"].replace(0, np.nan)),
     ("hr_per_hour", lambda df: df["avg_hr"] / df["work_hours"].replace(0, np.nan)),
@@ -210,6 +210,7 @@ def run_pipeline(
         "time_per_delivery","deliveries_per_hour","steps_per_hour","steps_per_delivery",
         "hr_per_step","hr_per_hour"
     ]
+    # 기사별 Z-score 정규화 (FastAI 모델의 핵심 Feature)
     df = zscore_by_group(df, "courier_id", numeric_cols, min_count=7)
 
     # 3. 학습/예측 데이터 분리

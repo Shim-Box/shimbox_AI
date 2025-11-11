@@ -1,12 +1,16 @@
 import pandas as pd
 import numpy as np
-import os
 from math import radians, sin, cos, sqrt, atan2
 from sklearn.metrics import mean_absolute_error
 from typing import Optional, List, Dict, Tuple
+import logging
 
 from . import api_client, model, data_processor
 from .model import SCALER_MIN, SCALER_RANGE
+
+# 로깅 기본 설정
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
@@ -14,74 +18,75 @@ def haversine_km(lat1, lon1, lat2, lon2):
     dphi = radians(lat2 - lat1)
     dlambda = radians(lon2 - lon1)
     a = sin(dphi/2)**2 + cos(phi1)*cos(phi2)*sin(dlambda/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return R * c
+    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
-def apply_policy(pred_qty: np.ndarray,
-                 wish: np.ndarray,
-                 min_qty: float,
-                 max_multiplier: float=1.30,
-                 wish_weight: float=0.03) -> np.ndarray:
-    
+
+def apply_policy(pred_qty, wish, min_qty, max_multiplier=1.30, wish_weight=0.03):
+    """
+    정책 기반 물량 조정
+    """
     rec = pred_qty + wish_weight * wish * 100
     rec = np.maximum(rec, min_qty)
-    
     return rec
 
-def assign_to_zones(df_recommend: pd.DataFrame,
-                    couriers_df: pd.DataFrame,
-                    zones_df: pd.DataFrame,
-                    round_unit:int=1) -> pd.DataFrame:
-    
-    pairs = []
-    for _, c in couriers_df.iterrows():
-        for _, z in zones_df.iterrows():
-            d = haversine_km(c["home_lat"], c["home_lng"], z["zone_lat"], z["zone_lng"])
-            pairs.append({"courier_id": c["courier_id"], "zone_id": z["zone_id"], "distance_km": d})
-    dist_df = pd.DataFrame(pairs)
 
-    tmp = df_recommend[["courier_id","a_star","strain","wish"]].copy()
+def assign_to_zones(df_recommend, couriers_df, zones_df, round_unit=1):
+    """
+    거리 기반 zone 할당 + zone별 수요 충족률 계산
+    """
+    pairs = [
+        {
+            "courier_id": c["courier_id"],
+            "zone_id": z["zone_id"],
+            "distance_km": haversine_km(c["home_lat"], c["home_lng"], z["zone_lat"], z["zone_lng"])
+        }
+        for _, c in couriers_df.iterrows()
+        for _, z in zones_df.iterrows()
+    ]
+
+    dist_df = pd.DataFrame(pairs)
+    tmp = df_recommend[["courier_id", "a_star", "strain", "wish"]]
     dist_df = dist_df.merge(tmp, on="courier_id", how="left")
+
+    dist_df["priority_score"] = dist_df["distance_km"] - dist_df["strain"] * 10 - dist_df["wish"] * 5
+    dist_df = dist_df.sort_values("priority_score")
 
     assignments = []
     remaining_by_courier = tmp.set_index("courier_id")["a_star"].to_dict()
     remaining_by_zone = zones_df.set_index("zone_id")["demand_qty"].to_dict()
 
-    dist_df["priority_score"] = dist_df["distance_km"] - dist_df["strain"] * 10 - dist_df["wish"] * 5
-    dist_df = dist_df.sort_values(by="priority_score", ascending=True)
-
     for zid in zones_df["zone_id"]:
-        cand = dist_df[dist_df["zone_id"]==zid].copy()
-        
         need = remaining_by_zone.get(zid, 0)
         if need <= 0:
             continue
 
-        for _, row in cand.iterrows():
+        for _, row in dist_df[dist_df["zone_id"] == zid].iterrows():
             cid = row["courier_id"]
-            if need <= 0:
-                break
             cap = remaining_by_courier.get(cid, 0)
-            if cap <= 0:
+            if need <= 0 or cap <= 0:
                 continue
 
             give = min(cap, need)
-            give = int(give) // round_unit * round_unit
+            give = (int(give) // round_unit) * round_unit
             if give <= 0:
                 continue
 
-            assignments.append({"courier_id": cid, "zone_id": zid, "assigned_qty": int(give)})
+            assignments.append({"courier_id": cid, "zone_id": zid, "assigned_qty": give})
             remaining_by_courier[cid] -= give
             need -= give
 
         remaining_by_zone[zid] = need
-        
-    mae = mean_absolute_error(
-        zones_df["demand_qty"].values, 
-        pd.DataFrame(assignments).groupby('zone_id')['assigned_qty'].sum().reindex(zones_df["zone_id"], fill_value=0).values
+
+    # zone별 MAE 계산
+    assign_df = pd.DataFrame(assignments)
+    assigned_sum = (
+        assign_df.groupby("zone_id")["assigned_qty"].sum()
+        .reindex(zones_df["zone_id"], fill_value=0)
+        .fillna(0)
     )
-    
-    return pd.DataFrame(assignments), mae
+
+    mae = mean_absolute_error(zones_df["demand_qty"], assigned_sum)
+    return assign_df, mae
 
 
 def run_pipeline(
@@ -91,72 +96,71 @@ def run_pipeline(
     today_date: str,
     use_true_target: bool = False,
     login_info: Dict[str, str] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[float]]:
-    
+):
+    logging.info("로그인 토큰 요청 중...")
     access_token = api_client.login_and_get_token(login_info)
     if not access_token:
         raise ValueError("외부 API 로그인 실패 (토큰 획득 실패)")
 
     couriers_df = api_client.get_approved_drivers(
-        access_token, 
-        allowed_attendance=['출근'], 
-        allowed_conditions=['양호', '보통']
+        access_token,
+        allowed_attendance=["출근"],
+        allowed_conditions=["양호", "보통"],
     )
-    
+
     if couriers_df.empty:
         raise ValueError("배정 가능한 기사가 없습니다.")
 
-    recommendations_list = []
-    
-    couriers_df['courier_id'] = couriers_df['courier_id'].apply(lambda x: int(x.split('_')[1]))
-    daily_metrics['courier_id'] = daily_metrics['courier_id'].apply(lambda x: int(x.split('_')[1]))
-    daily_surveys['courier_id'] = daily_surveys['courier_id'].apply(lambda x: int(x.split('_')[1]))
-    
+    logging.info(f"활성 기사 수: {len(couriers_df)}명")
+
+    def safe_parse_id(x):
+        try:
+            return int(str(x).split("_")[-1])
+        except Exception:
+            return int(x) if str(x).isdigit() else np.nan
+
+    for df in [couriers_df, daily_metrics, daily_surveys]:
+        df["courier_id"] = df["courier_id"].apply(safe_parse_id)
+
+    recommendations = []
+
     for _, courier in couriers_df.iterrows():
-        cid = courier['courier_id']
-        
-        X_sequence = data_processor.prepare_prediction_data(
-            courier_id=cid, 
+        cid = courier["courier_id"]
+
+        X_seq = data_processor.prepare_prediction_data(
+            courier_id=cid,
             date_target=today_date,
-            couriers_df=couriers_df, 
+            couriers_df=couriers_df,
             daily_metrics_df=daily_metrics,
-            daily_surveys_df=daily_surveys
+            daily_surveys_df=daily_surveys,
         )
 
-        if X_sequence is None:
-            pred_qty = data_processor.decide_target_count(courier.get('skill'), {})
-            base_qty = daily_metrics[
-                (daily_metrics['courier_id'] == cid) & 
-                (daily_metrics['date'] == pd.to_datetime(today_date) - pd.Timedelta(days=1))
-            ]['deliveries'].iloc[0] if not daily_metrics.empty else pred_qty
-            
+        if X_seq is None:
+            pred_qty = data_processor.decide_target_count(courier.get("skill"), {})
+            base_qty = (
+                daily_metrics.query("courier_id == @cid")["deliveries"].iloc[-1]
+                if not daily_metrics.empty else pred_qty
+            )
         else:
-            pred_output_norm = model.patchtst_predict(X_sequence) 
-            
-            pred_qty = (pred_output_norm * SCALER_RANGE) + SCALER_MIN
-            pred_qty = int(np.round(pred_qty[0]))
-            
-            base_qty = daily_metrics[
-                (daily_metrics['courier_id'] == cid) & 
-                (pd.to_datetime(daily_metrics['date']).dt.date == (pd.to_datetime(today_date) - pd.Timedelta(days=1)).date())
-            ]['deliveries'].iloc[0] if not daily_metrics.empty else pred_qty
+            pred_norm = model.patchtst_predict(X_seq)
+            pred_qty = int(np.round(pred_norm * SCALER_RANGE + SCALER_MIN))
+            base_qty = (
+                daily_metrics.query("courier_id == @cid")["deliveries"].iloc[-1]
+                if not daily_metrics.empty else pred_qty
+            )
 
-        
-        wish = courier.get('wish', 0)
-        strain = courier.get('strain', 0)
-        
+        wish = courier.get("wish", 0)
+        strain = courier.get("strain", 0)
+
         a_star = apply_policy(
-            np.array([pred_qty]), 
-            np.array([wish]),
-            min_qty=data_processor.decide_target_count(courier.get('skill'), {}),
-            max_multiplier=1.30, 
+            np.array([pred_qty]), np.array([wish]),
+            min_qty=data_processor.decide_target_count(courier.get("skill"), {}),
             wish_weight=0.03
         )[0]
-        
-        max_limit = int(base_qty * 1.30)
-        a_star = min(a_star, max_limit)
-        
-        recommendations_list.append({
+
+        a_star = min(a_star, int(base_qty * 1.3))
+
+        recommendations.append({
             "date": today_date,
             "courier_id": cid,
             "today_qty": base_qty,
@@ -164,20 +168,15 @@ def run_pipeline(
             "strain": strain,
             "wish": wish,
             "a_star": int(a_star),
-            "rec_ratio": round(a_star / base_qty if base_qty > 0 else 1.0, 3)
+            "rec_ratio": round(a_star / base_qty if base_qty > 0 else 1.0, 3),
         })
 
-    recommendations = pd.DataFrame(recommendations_list)
-    
+    rec_df = pd.DataFrame(recommendations)
     assignments, mae = assign_to_zones(
-        recommendations, 
-        couriers_df[["courier_id","home_lat","home_lng"]].drop_duplicates(subset=['courier_id']), 
-        zones, 
-        round_unit=1
+        rec_df,
+        couriers_df[["courier_id", "home_lat", "home_lng"]].drop_duplicates(),
+        zones,
     )
-    
-    return recommendations, assignments, mae
 
-
-if __name__ == '__main__':
-    pass
+    logging.info(f"✅ 파이프라인 완료 — MAE: {mae:.4f}")
+    return rec_df, assignments, mae

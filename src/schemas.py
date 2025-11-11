@@ -6,9 +6,9 @@ from datetime import date
 class Recommendation(BaseModel):
     courier_id: int
     today_qty: int
-    strain: float  # 계산된 최종 strain
+    strain: float 
     wish: float
-    a_star: int    # 추천 물량
+    a_star: int 
     rec_ratio: float
 
     class Config:

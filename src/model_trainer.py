@@ -7,7 +7,7 @@ from xgboost import XGBRegressor
 import joblib 
 import os
 
-#data_processor에서 정의된 것과 동일한 Feature 목록 사용
+# data_processor에서 정의된 것과 동일한 Feature 목록 사용
 FEATURES = [
     'skill', 'total_work_hours', 'delivery_count_yesterday', 'bmi', 'bmr', 
     'avg_heart_rate', 'steps', 'load_rel', 'strain', 'wish', 'driver_id',
@@ -19,9 +19,6 @@ DATA_PATH = 'data/processed/processed_logistics_data.csv'
 MODEL_SAVE_PATH = 'models/optimal_capacity_predictor.pkl'
 
 def train_and_save_model():
-    """
-    데이터를 로드하고, XGBoost 모델을 학습시키며, 학습된 모델을 저장합니다.
-    """
     try:
         df = pd.read_csv(DATA_PATH)
     except FileNotFoundError:

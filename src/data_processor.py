@@ -1,135 +1,110 @@
 import pandas as pd
 import numpy as np
-import os
 import re
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
-from pathlib import Path
 
-from .model import CONTEXT, CHANNELS
-
-
+CONTEXT = 14
+CHANNELS = [
+    "deliveries", "work_hours", "steps", "avg_hr", "strain", "wish",
+    "time_per_delivery", "deliveries_per_hour", "steps_per_hour", "hr_per_hour",
+    "role_idx", "difficulty_dummy"
+]
 
 def normalize_phone(phone: str) -> str:
-    if not phone:
-        return ""
+    if not phone: return ""
     return re.sub(r"[^\d]", "", str(phone))
 
-
 def normalize_postal(postal: str) -> str:
-    if not postal:
-        return ""
+    if not postal: return ""
     return re.sub(r"\s+", "", str(postal).strip())
-
 
 def normalize_career(career: Optional[str]) -> str:
     if career in ["초보자", "경력자", "숙련자"]:
         return career
     return "기타"
 
-
-
 def load_orders_from_excel(file_path: str) -> pd.DataFrame:
-    df = pd.read_excel(file_path, dtype=str)  # 숫자 앞자리 보존
-
+    df = pd.read_excel(file_path, dtype=str)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     required_cols = ["name", "phone", "postal", "address", "product_name", "qty"]
-    missing = [col for col in required_cols if col not in df.columns]
+    missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"엑셀 파일에 필수 컬럼 누락: {missing}")
-
     df["phone"] = df["phone"].apply(normalize_phone)
     df["postal"] = df["postal"].apply(normalize_postal)
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(int)
-
     return df[required_cols]
 
-
-
 def decide_target_count(career: Optional[str], health: Dict[str, Any]) -> int:
-    base_target = 10
-
-    if career == "초보자":
-        base_target = 8
-    elif career == "숙련자":
-        base_target = 12
-
-    finish3_response = health.get("finish3", 0)
-
-    if finish3_response == -1:
-        base_target = max(5, int(base_target * 0.7))
-    elif finish3_response == 1:
-        base_target = int(base_target * 1.1)
-
+    base_target = {"초보자": 8, "경력자": 10, "숙련자": 12}.get(career or "경력자", 10)
+    finish3 = health.get("finish3", 0)
+    if finish3 == 1:
+        return int(round(base_target * 1.6))
+    if finish3 == -1:
+        return max(1, int(round(base_target * 0.6)))
     return int(base_target)
 
+def prepare_prediction_data(
+    courier_id: int,
+    date_target: str,
+    couriers_df: pd.DataFrame,
+    daily_metrics_df: pd.DataFrame,
+    daily_surveys_df: pd.DataFrame,
+) -> Optional[np.ndarray]:
 
-def prepare_prediction_data(courier_id: str, date_target: str) -> Optional[np.ndarray]:
-    base_dir = Path(__file__).resolve().parent
-    data_dir = base_dir / "data" / "raw"
-    metrics_path = data_dir / "daily_metrics.csv"
-    surveys_path = data_dir / "daily_surveys.csv"
-    couriers_path = data_dir / "couriers.csv"
-
-    if not (metrics_path.exists() and surveys_path.exists() and couriers_path.exists()):
-        print("⚠️ 데이터 파일이 누락되어 있습니다. (metrics/surveys/couriers)")
+    if daily_metrics_df is None or daily_surveys_df is None or couriers_df is None:
         return None
 
-    df_metrics = pd.read_csv(metrics_path)
-    df_surveys = pd.read_csv(surveys_path)
-    df_merged = pd.merge(df_metrics, df_surveys, on=["date", "courier_id"], how="inner")
+    for df in (daily_metrics_df, daily_surveys_df):
+        if not df.empty and "courier_id" in df.columns:
+            df["courier_id"] = df["courier_id"].apply(lambda x: int(str(x).split("_")[-1]) if pd.notna(x) else x)
 
-    df_courier = pd.read_csv(couriers_path)
-    role_map = {"초보자": 0, "경력자": 1, "숙련자": 2}
-    df_courier["role_idx"] = df_courier["skill"].map(role_map).fillna(1).astype(int)
+    m = daily_metrics_df.copy()
+    s = daily_surveys_df.copy()
+    for col in ["deliveries", "work_hours", "steps", "avg_hr"]:
+        if col not in m.columns: m[col] = np.nan
+    for col in ["strain", "wish"]:
+        if col not in s.columns: s[col] = np.nan
 
-    df_target = df_merged[df_merged["courier_id"] == courier_id].copy()
-    if df_target.empty:
-        print(f"⚠️ courier_id {courier_id} 데이터 없음.")
-        return None
+    m["date"] = pd.to_datetime(m["date"], errors="coerce")
+    s["date"] = pd.to_datetime(s["date"], errors="coerce")
 
-    df_target["date"] = pd.to_datetime(df_target["date"])
-    df_target = df_target.sort_values("date").reset_index(drop=True)
+    merged = pd.merge(
+        m[["date", "courier_id", "deliveries", "work_hours", "steps", "avg_hr"]],
+        s[["date", "courier_id", "strain", "wish"]],
+        on=["date", "courier_id"], how="left",
+    )
+    merged = merged[merged["courier_id"] == int(courier_id)].copy()
+    if merged.empty: return None
+    merged = merged.sort_values("date").reset_index(drop=True)
 
     target_dt = datetime.strptime(date_target, "%Y-%m-%d")
     start_dt = target_dt - timedelta(days=CONTEXT - 1)
-    df_window = df_target[(df_target["date"] >= start_dt) & (df_target["date"] <= target_dt)]
+    win = merged[(merged["date"] >= start_dt) & (merged["date"] <= target_dt)].copy()
+    if len(win) < CONTEXT: return None
 
-    if len(df_window) < CONTEXT:
-        print(f"⚠️ {courier_id}의 최근 {CONTEXT}일 데이터 부족.")
-        return None
+    role_map = {"초보자": 0, "경력자": 1, "숙련자": 2}
+    skill = None
+    if "skill" in couriers_df.columns:
+        row = couriers_df[couriers_df["courier_id"] == int(courier_id)]
+        if not row.empty:
+            skill = row["skill"].iloc[0]
+    role_idx = role_map.get(skill, 1)
 
-    role_idx = df_courier.loc[
-        df_courier["courier_id"] == courier_id, "role_idx"
-    ].squeeze() if courier_id in df_courier["courier_id"].values else 1
+    win["role_idx"] = int(role_idx)
+    win["difficulty_dummy"] = 1.0
 
-    df_window["role_idx"] = role_idx
-    df_window["difficulty_dummy"] = 1.0
+    win["time_per_delivery"] = np.where(win["deliveries"] > 0, (win["work_hours"] * 60) / win["deliveries"], np.nan)
+    win["deliveries_per_hour"] = np.where(win["work_hours"] > 0, win["deliveries"] / win["work_hours"], np.nan)
+    win["steps_per_hour"] = np.where(win["work_hours"] > 0, win["steps"] / win["work_hours"], np.nan)
+    win["hr_per_hour"] = np.where(win["work_hours"] > 0, win["avg_hr"] / win["work_hours"], np.nan)
 
-    # 파생 변수 계산
-    df_window["time_per_delivery"] = np.where(
-        df_window["deliveries"] > 0,
-        (df_window["work_hours"] * 60) / df_window["deliveries"],
-        np.nan,
-    )
-    df_window["deliveries_per_hour"] = np.where(
-        df_window["work_hours"] > 0,
-        df_window["deliveries"] / df_window["work_hours"],
-        np.nan,
-    )
-    df_window["steps_per_hour"] = np.where(
-        df_window["work_hours"] > 0,
-        df_window["steps"] / df_window["work_hours"],
-        np.nan,
-    )
-    df_window["hr_per_hour"] = np.where(
-        df_window["work_hours"] > 0,
-        df_window["avg_hr"] / df_window["work_hours"],
-        np.nan,
-    )
+    win = win.fillna(win.mean(numeric_only=True)).fillna(0)
 
-    df_window = df_window.fillna(df_window.mean(numeric_only=True)).fillna(0)
+    for c in CHANNELS:
+        if c not in win.columns:
+            win[c] = 0.0
 
-    X_sequence = df_window.tail(CONTEXT)[CHANNELS].to_numpy(dtype="float32")
-
-    return X_sequence.reshape(1, CONTEXT, len(CHANNELS))
+    X = win.tail(CONTEXT)[CHANNELS].to_numpy(dtype="float32")
+    return X.reshape(1, CONTEXT, len(CHANNELS))

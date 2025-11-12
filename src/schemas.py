@@ -1,9 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import date
 
-#API 응답 스키마: 기사별 추천 물량 결과
 class Recommendation(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     courier_id: int
     today_qty: int
     strain: float 
@@ -11,16 +11,11 @@ class Recommendation(BaseModel):
     a_star: int 
     rec_ratio: float
 
-    class Config:
-        orm_mode = True
-
 class Assignment(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     courier_id: int
     zone_id: int
     assigned_qty: int
-
-    class Config:
-        orm_mode = True
 
 class PipelineResult(BaseModel):
     mae: Optional[float]

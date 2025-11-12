@@ -1,13 +1,9 @@
-from sqlalchemy import (
-    Column, Integer, String, Float, Date, ForeignKey, UniqueConstraint, Index, CheckConstraint
-)
+from sqlalchemy import Column, Integer, String, Float, Date, ForeignKey, UniqueConstraint, Index, CheckConstraint
 from sqlalchemy.orm import relationship
 from .database import Base
 
-# 기사 정보 테이블
 class Courier(Base):
     __tablename__ = "couriers"
-
     courier_id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True, nullable=False)
     age = Column(Integer, nullable=True)
@@ -16,25 +12,9 @@ class Courier(Base):
     home_lat = Column(Float, nullable=True)
     home_lng = Column(Float, nullable=True)
 
-    # 관계 설정
-    metrics = relationship(
-        "DailyMetric",
-        back_populates="courier",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    surveys = relationship(
-        "DailySurvey",
-        back_populates="courier",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    assignments = relationship(
-        "AssignmentResult",
-        back_populates="courier",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
+    metrics = relationship("DailyMetric", back_populates="courier", cascade="all, delete-orphan", passive_deletes=True)
+    surveys = relationship("DailySurvey", back_populates="courier", cascade="all, delete-orphan", passive_deletes=True)
+    assignments = relationship("AssignmentResult", back_populates="courier", cascade="all, delete-orphan", passive_deletes=True)
 
     __table_args__ = (
         CheckConstraint("age IS NULL OR age >= 16", name="ck_couriers_age_min"),
@@ -42,20 +22,11 @@ class Courier(Base):
         CheckConstraint("weight IS NULL OR weight > 0", name="ck_couriers_weight_pos"),
     )
 
-
-# 일일 활동 테이블
 class DailyMetric(Base):
     __tablename__ = "daily_metrics"
-
     id = Column(Integer, primary_key=True, index=True)
     date = Column(Date, index=True, nullable=False)
-    courier_id = Column(
-        Integer,
-        ForeignKey("couriers.courier_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
+    courier_id = Column(Integer, ForeignKey("couriers.courier_id", ondelete="CASCADE"), index=True, nullable=False)
     work_hours = Column(Float, nullable=False, default=0.0)
     deliveries = Column(Integer, nullable=False, default=0)
     avg_hr = Column(Float, nullable=True)
@@ -71,20 +42,11 @@ class DailyMetric(Base):
         Index("ix_daily_metrics_courier_date", "courier_id", "date"),
     )
 
-
-# 일일 설문 테이블 (피로도/희망 물량)
 class DailySurvey(Base):
     __tablename__ = "daily_surveys"
-
     id = Column(Integer, primary_key=True, index=True)
     date = Column(Date, index=True, nullable=False)
-    courier_id = Column(
-        Integer,
-        ForeignKey("couriers.courier_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-
+    courier_id = Column(Integer, ForeignKey("couriers.courier_id", ondelete="CASCADE"), index=True, nullable=False)
     strain = Column(Float, nullable=True) 
     wish = Column(Float, nullable=True)
 
@@ -97,38 +59,20 @@ class DailySurvey(Base):
         Index("ix_daily_surveys_courier_date", "courier_id", "date"),
     )
 
-
-# 지역 정보 테이블
 class Zone(Base):
     __tablename__ = "zones"
-
     zone_id = Column(Integer, primary_key=True, index=True)
     zone_name = Column(String, nullable=False, unique=True)
     zone_lat = Column(Float, nullable=True)
     zone_lng = Column(Float, nullable=True)
-
-    # 당일 수요
     demand_qty = Column(Integer, nullable=True, default=None)
 
-
-# 최종 배정 결과 테이블 (API 결과 저장)
 class AssignmentResult(Base):
     __tablename__ = "assignment_results"
-
     id = Column(Integer, primary_key=True, index=True)
     date = Column(Date, index=True, nullable=False)
-    courier_id = Column(
-        Integer,
-        ForeignKey("couriers.courier_id", ondelete="CASCADE"),
-        index=True,
-        nullable=False,
-    )
-    zone_id = Column(
-        Integer,
-        ForeignKey("zones.zone_id", ondelete="RESTRICT"),
-        index=True,
-        nullable=False,
-    )
+    courier_id = Column(Integer, ForeignKey("couriers.courier_id", ondelete="CASCADE"), index=True, nullable=False)
+    zone_id = Column(Integer, ForeignKey("zones.zone_id", ondelete="RESTRICT"), index=True, nullable=False)
     assigned_qty = Column(Integer, nullable=False, default=0)
 
     courier = relationship("Courier", back_populates="assignments")

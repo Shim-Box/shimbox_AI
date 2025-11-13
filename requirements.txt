@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+
+requests
+
+pandas
+numpy
+openpyxl
+
+scikit-learn
+joblib
+
+python-multipart

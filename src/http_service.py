@@ -1,4 +1,3 @@
-# src/http_service.py
 from __future__ import annotations
 
 from tempfile import NamedTemporaryFile

@@ -1,113 +1,101 @@
+import os
+import logging
+from typing import List
+
 import pandas as pd
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import text, select
 from sqlalchemy.orm import Session
-from sqlalchemy import text
-from . import models, schemas, database, main, api_client
-from datetime import date
-from typing import Optional
 
-app = FastAPI(
-    title="📦 기사 건강 맞춤 물류 배정 시스템 API",
-    description="외부 API(기사 데이터)와 내부 DB(활동 기록, 지역 정보)를 통합한 배정 서비스입니다. Swagger UI(/docs)를 통해 테스트할 수 있습니다.",
-)
+from .database import get_db
+from .model import Zone, AssignmentResult
+from . import schemas
+from . import pipeline
 
-# DB 연결 및 테이블 생성
-models.Base.metadata.create_all(bind=database.engine)
+# (선택) ShimBox 워크플로 API로 감싸서 실행
+from .workflows.reallocate import main as run_reallocation
 
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s")
 
-def get_db():
-    db = database.SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+router = APIRouter(prefix="/api", tags=["📦 배정 파이프라인"])
 
-
-@app.get("/health", summary="API 상태 확인", status_code=status.HTTP_200_OK)
+@router.get("/health", summary="API 상태 확인", status_code=status.HTTP_200_OK)
 def health_check():
-    """API 서버의 상태를 확인합니다."""
     return {"status": "ok", "message": "Courier Assignment System is running."}
 
+def _zones_df(db: Session) -> pd.DataFrame:
+    rows = db.execute(select(Zone.zone_id, Zone.zone_lat, Zone.zone_lng, Zone.demand_qty)).all()
+    return pd.DataFrame(rows, columns=["zone_id", "zone_lat", "zone_lng", "demand_qty"])
 
-@app.post("/run-assignment", response_model=schemas.PipelineResult, summary="AI 기반 물류 배정 실행")
-def run_assignment(
-    request: schemas.RunPipelineRequest,
-    db: Session = Depends(get_db)
-):
-    """
-    특정 날짜의 지역별 물류 수요를 기반으로 기사별 물량 추천 및 지역 할당을 실행합니다.
-    """
-    today_date_str = request.today_date.strftime('%Y-%m-%d')
-    print(f"\n--- AI Pipeline 실행 요청 ({today_date_str}) ---")
-    
-    
-    login_info = {"username": "admin", "password": "password"} 
-    
-    access_token = api_client.login_and_get_token(login_info)
-    if not access_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="외부 API 로그인 실패 (토큰 획득 실패)")
-
-    couriers_df = api_client.get_approved_drivers(
-        access_token, 
-        allowed_attendance=['출근'], 
-        allowed_conditions=['양호', '보통']
-    )
-    
-    if couriers_df.empty:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="배정 가능한 기사가 없습니다. (필터 조건 또는 API 응답 확인)")
+@router.post("/run-assignment", response_model=schemas.PipelineResult, summary="AI 기반 물류 배정 실행")
+def run_assignment(request: schemas.RunPipelineRequest, db: Session = Depends(get_db)):
+    today_date_str = request.today_date.strftime("%Y-%m-%d")
+    logging.info(f"🚀 AI Pipeline 실행 요청: {today_date_str}")
 
     try:
-        daily_metrics_df = pd.read_sql_query(text("SELECT * FROM daily_metrics"), db.bind)
-        daily_surveys_df = pd.read_sql_query(text("SELECT * FROM daily_surveys"), db.bind)
-        
-        zones_data = db.query(models.Zone).all()
-        zones_df = pd.DataFrame([vars(z) for z in zones_data if not z.zone_id.startswith('_')]) # SQLAlchemy 객체를 DataFrame으로 변환
+        try:
+            daily_metrics_df = pd.read_sql_query(text("SELECT * FROM daily_metrics"), db.bind)
+            daily_surveys_df = pd.read_sql_query(text("SELECT * FROM daily_surveys"), db.bind)
+        except Exception:
+            logging.warning("⚠️ metrics 또는 surveys 테이블이 비어 있습니다.")
+            daily_metrics_df, daily_surveys_df = pd.DataFrame(), pd.DataFrame()
+
+        zones_df = _zones_df(db)
+        if zones_df.empty:
+            raise HTTPException(status_code=404, detail="Zone 데이터가 없습니다. 먼저 지역 데이터를 등록하세요.")
 
         demand_map = {d.zone_id: d.demand_qty for d in request.zone_demands}
-        zones_df['demand_qty'] = zones_df['zone_id'].map(demand_map).fillna(0).astype(int)
-        
-        TOTAL_DEMAND = zones_df['demand_qty'].sum()
-        
-        recommendations, assignments, mae = main.run_pipeline(
+        zones_df["demand_qty"] = zones_df["zone_id"].map(demand_map).fillna(0).astype(int)
+        total_demand = int(zones_df["demand_qty"].sum())
+
+        login_info = {
+            "username": os.getenv("API_USERNAME", "admin"),
+            "password": os.getenv("API_PASSWORD", "password"),
+        }
+
+        rec_df, assign_df, mae = pipeline.run_pipeline(
             daily_metrics=daily_metrics_df,
             daily_surveys=daily_surveys_df,
-            couriers=couriers_df,
             zones=zones_df,
             today_date=today_date_str,
-            use_true_target=False
-        )
-        
-        TOTAL_ASSIGNED = assignments['assigned_qty'].sum()
-        
-        db_assignments = []
-        for _, row in assignments.iterrows():
-            db_assignment = models.AssignmentResult(
-                date=request.today_date,
-                courier_id=int(row['courier_id']),
-                zone_id=int(row['zone_id']),
-                assigned_qty=int(row['assigned_qty'])
-            )
-            db_assignments.append(db_assignment)
-            
-        db.execute(text("DELETE FROM assignment_results WHERE date = :date"), {"date": request.today_date})
-        db.bulk_save_objects(db_assignments)
-        db.commit()
-        
-        print(f"--- 실행 완료. 총 수요: {TOTAL_DEMAND}, 총 할당: {TOTAL_ASSIGNED}, MAE: {mae} ---")
-        
-        return schemas.PipelineResult(
-            mae=mae,
-            recommendations=recommendations.to_dict('records'),
-            assignments=assignments.to_dict('records'),
-            total_assigned_qty=TOTAL_ASSIGNED,
-            total_demand_qty=TOTAL_DEMAND
-        )
-        
-    except Exception as e:
-        db.rollback()
-        print(f"❌ 오류 발생: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"AI 파이프라인 실행 중 치명적인 오류 발생: {str(e)}"
+            use_true_target=False,
+            login_info=login_info,
         )
 
+        total_assigned = int(assign_df["assigned_qty"].sum()) if not assign_df.empty else 0
+
+        db.execute(text("DELETE FROM assignment_results WHERE date = :date"), {"date": request.today_date})
+        if not assign_df.empty:
+            db.bulk_save_objects([
+                AssignmentResult(
+                    date=request.today_date,
+                    courier_id=int(row["courier_id"]),
+                    zone_id=int(row["zone_id"]),
+                    assigned_qty=int(row["assigned_qty"]),
+                )
+                for _, row in assign_df.iterrows()
+            ])
+        db.commit()
+
+        logging.info(f"✅ 파이프라인 완료: 수요={total_demand}, 할당={total_assigned}, MAE={mae:.4f}")
+
+        return schemas.PipelineResult(
+            mae=float(mae),
+            recommendations=rec_df.to_dict("records"),
+            assignments=assign_df.to_dict("records") if not assign_df.empty else [],
+            total_assigned_qty=total_assigned,
+            total_demand_qty=total_demand,
+        )
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        logging.exception("❌ AI 파이프라인 실행 중 오류 발생")
+        raise HTTPException(status_code=500, detail=f"AI 파이프라인 실행 실패: {type(e).__name__}: {str(e)}")
+
+@router.post("/reallocate", summary="ShimBox 재배정 워크플로 실행")
+def reallocate():
+    run_reallocation()
+    return {"status": "ok"}

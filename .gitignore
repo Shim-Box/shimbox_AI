@@ -1,0 +1,24 @@
+# venv / caches
+.venv/
+env/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# local data
+sql_app.db
+*.sqlite
+*.db
+*.csv
+*.xlsx
+
+# secrets
+.env

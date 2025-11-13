@@ -1,74 +1,110 @@
 import pandas as pd
 import numpy as np
-import os
+import re
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
 
-def create_and_save_all_data(num_days=180, num_couriers=15, num_zones=5):
-    """
-    프로젝트에 필요한 4가지 가상 데이터 파일을 생성하고 저장합니다.
-    """
-    np.random.seed(42)
-    os.makedirs('data/raw', exist_ok=True)
-    
-    #기사 프로필
-    courier_ids = [f'C_{i:02d}' for i in range(1, num_couriers + 1)]
-    couriers_df = pd.DataFrame({
-        'courier_id': courier_ids,
-        'skill': np.random.choice(['초보자', '경력자', '숙련자'], num_couriers, p=[0.3, 0.4, 0.3]),
-        'home_lat': np.random.uniform(37.4, 37.6, num_couriers).round(5),
-        'home_lng': np.random.uniform(126.9, 127.1, num_couriers).round(5)
-    })
-    couriers_df.to_csv('data/raw/couriers.csv', index=False)
-    print("✅ data/raw/couriers.csv 생성 완료")
+CONTEXT = 14
+CHANNELS = [
+    "deliveries", "work_hours", "steps", "avg_hr", "strain", "wish",
+    "time_per_delivery", "deliveries_per_hour", "steps_per_hour", "hr_per_hour",
+    "role_idx", "difficulty_dummy"
+]
 
-    #지역 정보 및 수요
-    zones_df = pd.DataFrame({
-        'zone_id': [f'Z_{i}' for i in range(1, num_zones + 1)],
-        'zone_lat': np.random.uniform(37.4, 37.6, num_zones).round(5),
-        'zone_lng': np.random.uniform(126.9, 127.1, num_zones).round(5),
-        'demand_qty': np.random.randint(200, 300, num_zones) # 구역별 총 수요 (내일 수요)
-    })
-    zones_df.to_csv('data/raw/zones.csv', index=False)
-    print("✅ data/raw/zones.csv 생성 완료")
+def normalize_phone(phone: str) -> str:
+    if not phone: return ""
+    return re.sub(r"[^\d]", "", str(phone))
 
-    #일일 데이터
-    all_data = []
-    
-    for courier_id in courier_ids:
-        df = pd.DataFrame({
-            'date': pd.date_range(start='2024-01-01', periods=num_days, freq='D'),
-            'courier_id': courier_id,
-            
-            'work_hours': np.random.uniform(7, 11, num_days).round(1),
-            'deliveries': np.random.randint(80, 130, num_days), # 어제 처리 물량
-            'bmi': np.random.uniform(20, 28, num_days).round(1),
-            'avg_hr': np.random.uniform(70, 100, num_days).round(1),
-            'steps': np.random.randint(15000, 30000, num_days),
-        })
-        
-        df['load_rel'] = np.random.choice([-1, 0, 1], size=num_days, p=[0.2, 0.6, 0.2])
-        df['strain'] = np.random.choice([0.0, 0.5, 1.0], size=num_days, p=[0.5, 0.3, 0.2])
-        df['wish'] = np.random.choice([-1, 0, 1], size=num_days, p=[0.2, 0.6, 0.2])
-        
-        all_data.append(df)
-        
-    full_df = pd.concat(all_data, ignore_index=True)
-    
-    # 날짜 형식 조정
-    full_df['date'] = full_df['date'].dt.strftime('%Y-%m-%d')
+def normalize_postal(postal: str) -> str:
+    if not postal: return ""
+    return re.sub(r"\s+", "", str(postal).strip())
 
-    #업무/신체
-    metrics_cols = ['date', 'courier_id', 'work_hours', 'deliveries', 'bmi', 'avg_hr', 'steps']
-    full_df[metrics_cols].to_csv('data/raw/daily_metrics.csv', index=False)
-    print("✅ data/raw/daily_metrics.csv 생성 완료")
+def normalize_career(career: Optional[str]) -> str:
+    if career in ["초보자", "경력자", "숙련자"]:
+        return career
+    return "기타"
 
-    #설문
-    survey_cols = ['date', 'courier_id', 'load_rel', 'strain', 'wish']
-    full_df[survey_cols].to_csv('data/raw/daily_surveys.csv', index=False)
-    print("✅ data/raw/daily_surveys.csv 생성 완료")
+def load_orders_from_excel(file_path: str) -> pd.DataFrame:
+    df = pd.read_excel(file_path, dtype=str)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    required_cols = ["name", "phone", "postal", "address", "product_name", "qty"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"엑셀 파일에 필수 컬럼 누락: {missing}")
+    df["phone"] = df["phone"].apply(normalize_phone)
+    df["postal"] = df["postal"].apply(normalize_postal)
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(1).astype(int)
+    return df[required_cols]
 
+def decide_target_count(career: Optional[str], health: Dict[str, Any]) -> int:
+    base_target = {"초보자": 8, "경력자": 10, "숙련자": 12}.get(career or "경력자", 10)
+    finish3 = health.get("finish3", 0)
+    if finish3 == 1:
+        return int(round(base_target * 1.6))
+    if finish3 == -1:
+        return max(1, int(round(base_target * 0.6)))
+    return int(base_target)
 
-if __name__ == '__main__':
-    print("--- 🛠️ AI 시스템용 4가지 가상 데이터 생성 시작 ---")
-    create_and_save_all_data()
-    print("--------------------------------------------------")
-    print("🎉 모든 데이터 준비 완료. 이제 model_trainer.py를 실행할 수 있습니다.")
+def prepare_prediction_data(
+    courier_id: int,
+    date_target: str,
+    couriers_df: pd.DataFrame,
+    daily_metrics_df: pd.DataFrame,
+    daily_surveys_df: pd.DataFrame,
+) -> Optional[np.ndarray]:
+
+    if daily_metrics_df is None or daily_surveys_df is None or couriers_df is None:
+        return None
+
+    for df in (daily_metrics_df, daily_surveys_df):
+        if not df.empty and "courier_id" in df.columns:
+            df["courier_id"] = df["courier_id"].apply(lambda x: int(str(x).split("_")[-1]) if pd.notna(x) else x)
+
+    m = daily_metrics_df.copy()
+    s = daily_surveys_df.copy()
+    for col in ["deliveries", "work_hours", "steps", "avg_hr"]:
+        if col not in m.columns: m[col] = np.nan
+    for col in ["strain", "wish"]:
+        if col not in s.columns: s[col] = np.nan
+
+    m["date"] = pd.to_datetime(m["date"], errors="coerce")
+    s["date"] = pd.to_datetime(s["date"], errors="coerce")
+
+    merged = pd.merge(
+        m[["date", "courier_id", "deliveries", "work_hours", "steps", "avg_hr"]],
+        s[["date", "courier_id", "strain", "wish"]],
+        on=["date", "courier_id"], how="left",
+    )
+    merged = merged[merged["courier_id"] == int(courier_id)].copy()
+    if merged.empty: return None
+    merged = merged.sort_values("date").reset_index(drop=True)
+
+    target_dt = datetime.strptime(date_target, "%Y-%m-%d")
+    start_dt = target_dt - timedelta(days=CONTEXT - 1)
+    win = merged[(merged["date"] >= start_dt) & (merged["date"] <= target_dt)].copy()
+    if len(win) < CONTEXT: return None
+
+    role_map = {"초보자": 0, "경력자": 1, "숙련자": 2}
+    skill = None
+    if "skill" in couriers_df.columns:
+        row = couriers_df[couriers_df["courier_id"] == int(courier_id)]
+        if not row.empty:
+            skill = row["skill"].iloc[0]
+    role_idx = role_map.get(skill, 1)
+
+    win["role_idx"] = int(role_idx)
+    win["difficulty_dummy"] = 1.0
+
+    win["time_per_delivery"] = np.where(win["deliveries"] > 0, (win["work_hours"] * 60) / win["deliveries"], np.nan)
+    win["deliveries_per_hour"] = np.where(win["work_hours"] > 0, win["deliveries"] / win["work_hours"], np.nan)
+    win["steps_per_hour"] = np.where(win["work_hours"] > 0, win["steps"] / win["work_hours"], np.nan)
+    win["hr_per_hour"] = np.where(win["work_hours"] > 0, win["avg_hr"] / win["work_hours"], np.nan)
+
+    win = win.fillna(win.mean(numeric_only=True)).fillna(0)
+
+    for c in CHANNELS:
+        if c not in win.columns:
+            win[c] = 0.0
+
+    X = win.tail(CONTEXT)[CHANNELS].to_numpy(dtype="float32")
+    return X.reshape(1, CONTEXT, len(CHANNELS))

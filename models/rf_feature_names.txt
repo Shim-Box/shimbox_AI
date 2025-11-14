@@ -1,0 +1,11 @@
+driverId
+bmi
+career_enc
+finish1_enc
+finish2_enc
+finish3_enc
+condition_enc
+steps_mean_7
+work_hours_mean_7
+deliveries_mean_7
+deliveries_std_7

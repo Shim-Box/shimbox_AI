@@ -25,10 +25,3 @@ venv/
 
 # 로그
 *.log
-
-# (선택) 로컬에서만 쓰는 학습/모델 파일
-models/patchtst_cap/
-models/rf_capacity.pkl
-models/rf_feature_names.txt
-data/train_history.csv
-data/product_dummy.xlsx

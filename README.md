@@ -25,9 +25,7 @@ project/
 -------------------------------------------------
 
 ⚙️ 환경 설정 (.env)
-API_BASE_URL=http://your-api-server.com
-ADMIN_EMAIL=admin@gmail.com
-ADMIN_PASSWORD=12341234
+env해야함
 
 -------------------------------------------------
 
